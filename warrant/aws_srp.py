@@ -9,7 +9,7 @@ import boto3
 import os
 import six
 
-from .exceptions import ForceChangePasswordException
+from .exceptions import ForceChangePasswordException, ProvideMFATokenAction
 
 # https://github.com/aws/amazon-cognito-identity-js/blob/master/src/AuthenticationHelper.js#L22
 n_hex = 'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1' + '29024E088A67CC74020BBEA63B139B22514A08798E3404DD' + \
@@ -94,6 +94,7 @@ class AWSSRP(object):
 
     NEW_PASSWORD_REQUIRED_CHALLENGE = 'NEW_PASSWORD_REQUIRED'
     PASSWORD_VERIFIER_CHALLENGE = 'PASSWORD_VERIFIER'
+    SOFTWARE_TOKEN_MFA_CHALLENGE = 'SOFTWARE_TOKEN_MFA'
 
     def __init__(self, username, password, pool_id, client_id, pool_region=None,
                  client=None, client_secret=None):
@@ -197,27 +198,46 @@ class AWSSRP(object):
                 self.get_secret_hash(self.username, self.client_id, self.client_secret)})
         return response
 
-    def authenticate_user(self, client=None):
+    def authenticate_user(self, context=None, client=None):
         boto_client = self.client or client
-        auth_params = self.get_auth_params()
-        response = boto_client.initiate_auth(
-            AuthFlow='USER_SRP_AUTH',
-            AuthParameters=auth_params,
-            ClientId=self.client_id
-        )
-        if response['ChallengeName'] == self.PASSWORD_VERIFIER_CHALLENGE:
-            challenge_response = self.process_challenge(response['ChallengeParameters'])
-            tokens = boto_client.respond_to_auth_challenge(
+        if context is None:
+            context = {}
+            context['response'] = boto_client.initiate_auth(
+                AuthFlow='USER_SRP_AUTH',
+                AuthParameters=self.get_auth_params(),
                 ClientId=self.client_id,
-                ChallengeName=self.PASSWORD_VERIFIER_CHALLENGE,
-                ChallengeResponses=challenge_response)
+            )
+            context['srp_uid'] = context['response']['ChallengeParameters']['USER_ID_FOR_SRP']
 
-            if tokens.get('ChallengeName') == self.NEW_PASSWORD_REQUIRED_CHALLENGE:
+        while 'ChallengeName' in context['response']:
+            challenge_name = context['response']['ChallengeName']
+
+            if challenge_name == self.PASSWORD_VERIFIER_CHALLENGE:
+                challenge_response = self.process_challenge(context['response']['ChallengeParameters'])
+                context['response'] = boto_client.respond_to_auth_challenge(
+                    ClientId=self.client_id,
+                    ChallengeName=self.PASSWORD_VERIFIER_CHALLENGE,
+                    ChallengeResponses=challenge_response,
+                )
+
+            elif challenge_name == self.SOFTWARE_TOKEN_MFA_CHALLENGE:
+                mfa_code = context.get("SOFTWARE_TOKEN_MFA_CODE")
+                if mfa_code is None:
+                    raise ProvideMFATokenAction(context, self.authenticate_user)
+                context['response'] = boto_client.respond_to_auth_challenge(
+                    ClientId=self.client_id,
+                    ChallengeName="SOFTWARE_TOKEN_MFA",
+                    Session=context['response']["Session"],
+                    ChallengeResponses={
+                        'USERNAME': context['srp_uid'],
+                        'SOFTWARE_TOKEN_MFA_CODE': mfa_code
+                    },
+                )
+            elif challenge_name == self.NEW_PASSWORD_REQUIRED_CHALLENGE:
                 raise ForceChangePasswordException('Change password before authenticating')
-
-            return tokens
-        else:
-            raise NotImplementedError('The %s challenge is not supported' % response['ChallengeName'])
+            else:
+                raise NotImplementedError('The %s challenge is not supported' % response['ChallengeName'])
+        return context['response']
 
     def set_new_password_challenge(self, new_password, client=None):
         boto_client = self.client or client

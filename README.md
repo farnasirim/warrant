@@ -6,6 +6,85 @@ Makes working with AWS Cognito easier for Python developers.
 
 [![Build Status](https://travis-ci.org/capless/warrant.svg?branch=master)](https://travis-ci.org/capless/warrant)
 
+## MFA
+
+WARNING: to use this addition, you need to install **this** version of warrant
+through github (preferably). That means you'll have to somehow "instruct"
+`django-warrant` to use this library instread of the upstream warrant.
+
+MFA functionality is implemented without breaking the current interface by the
+use of excpetions as *actions* that the caller needs to take. The `authenticate`
+method is also refactored to make the new design fit a little bit smoother in
+the code. Here's how MFA might be used in django:
+
+
+ 1. Create a cognito user pool, and assign a domian name. Create a client app
+    in that user pool. If you don't want to force mfa for all users, then it
+    has to be enabled on a per user basis:
+    - Call the "associate software token" api through aws cli or boto3.
+    - Pass the secret to the TOTP app, obtain an OTP from the app.
+    - Use the obtained OTP with the "validate software token" api.
+    - Use the "set user mfa preference" api to enable mfa for the user.
+    - define user attribute mappings (cognito to db) using django-warrant
+
+ 2. Here's warrant's workflow with MFA:
+
+        ```python
+        cognito_user = Cognito(cognito_app_id, cognito_clinet_id,
+            username=cognito_username_to_login,
+            access_token=aws_access_token,
+            access_key=aws_access_key,
+            secret_key=aws_secret)
+        try:
+            cognito_user.authenticate(Password=password_of_user)
+        except ProvideMFATokenAction as e:
+            tokens = e.provide_mfa_code(client_otp_code)
+        ```
+    The way this works is that when we encounter an mfa challenge in the middle of
+    the awssrp flow, we notify this event all the way back tothe caller (which is
+    prepared for this by a `try ... except` block. The caller then proceeds to use
+    the "functor" that is supplied to it as an "exception" to call back "into" the
+    authentication function by providing it the mfa code, and everything is picked
+    up where it has been left off, with the new functor returning the tokens.
+    However except for the case that we have the username, password, and the otp
+    password all in the *same* django view handler (as opposed to having
+    username/pass and then proceeding to ask for the otp), we need to make
+    `django-warrant` able to handle this addition too.
+
+ 3. Apart from warrant difficulties, here are a few points about django-warrant:
+        The request object has to be passed in:
+        ```python
+        authenticate(request=request, username=email, password=password)
+        ```
+ 4. In Django settings:
+        ```python
+        import boto3
+
+        COGNITO_USER_POOL_ID = user_pool_id
+        COGNITO_APP_ID = cognito_app_id
+        boto3.setup_default_session(region_name='us-east-1', , aws_access_key_id=aws_access_key, aws_session_token=aws_session_token)
+
+        # if on ec2, we can just assume the role attached to the instance:
+        session = boto3.Session()
+        credentials = session.get_credentials()
+
+        token = credentials.token
+        key_id = credentials.access_key
+        secret_key = credentials.secret_key
+
+        boto3.setup_default_session(region_name='us-east-1',
+                                    aws_secret_access_key=secret_key,
+                                    aws_access_key_id=key_id,
+                                    aws_session_token=token)
+
+        AUTHENTICATION_BACKENDS = [
+            'django_warrant.backend.CognitoBackend',
+            'django.contrib.auth.backends.ModelBackend',
+        ]
+
+        ```
+
+
 ## Getting Started
 
 - [Python Versions Supported](#python-versions-supported)
